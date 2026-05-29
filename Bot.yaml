@@ -1,5 +1,7 @@
 name: Bot 24/7
 on:
+  schedule:
+    - cron: '0 */5 * * *'  # Каждые 5 часов
   workflow_dispatch:
 
 jobs:
