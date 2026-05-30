@@ -30,9 +30,20 @@ SessionLocal = sessionmaker(bind=engine)
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_ban_reason = State()
+    waiting_for_unban_id = State()
+    waiting_for_give_coins = State()
+    waiting_for_give_gems = State()
+    waiting_for_set_vip = State()
     waiting_for_artifact_target = State()
     waiting_for_artifact_type = State()
     waiting_for_artifact_rarity = State()
+    waiting_for_promo_code = State()
+    waiting_for_promo_coins = State()
+    waiting_for_promo_gems = State()
+    waiting_for_promo_limit = State()
+    waiting_for_promo_duration = State()
+    waiting_for_promo_item = State()
+    waiting_for_delete_promo = State()
 
 class FightStates(StatesGroup):
     in_fight = State()
@@ -46,7 +57,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 bot = None
 
-# ==================== МОДЕЛИ (сокращённые но полные) ====================
+# ==================== МОДЕЛИ ====================
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -82,6 +93,7 @@ class User(Base):
     is_banned = Column(Boolean, default=False)
     ban_reason = Column(String, default="")
     is_admin = Column(Boolean, default=False)
+    notifications_enabled = Column(Boolean, default=True)
     inventory = relationship("Inventory", back_populates="user", cascade="all, delete-orphan")
     artifacts = relationship("Artifact", back_populates="owner", foreign_keys="Artifact.owner_id")
     
@@ -188,6 +200,15 @@ class PromoUsed(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     promo_id = Column(Integer, ForeignKey("promo_codes.id"))
     used_at = Column(DateTime, default=datetime.now)
+
+class AdminLog(Base):
+    __tablename__ = "admin_logs"
+    id = Column(Integer, primary_key=True)
+    admin_id = Column(BigInteger, nullable=False)
+    action = Column(String)
+    target_id = Column(BigInteger, nullable=True)
+    details = Column(Text)
+    created_at = Column(DateTime, default=datetime.now)
 
 # ==================== ДАННЫЕ ====================
 
@@ -323,6 +344,11 @@ def open_pack(u,cfg):
 
 def is_admin(uid): return uid in ADMIN_IDS
 
+def log_action(admin_id, action, target_id=None, details=None):
+    s=SessionLocal()
+    s.add(AdminLog(admin_id=admin_id,action=action,target_id=target_id,details=details))
+    s.commit(); s.close()
+
 def main_menu():
     b=InlineKeyboardBuilder()
     for t,c in [("🏟 Шахты","m_arenas"),("👤 Профиль","m_profile"),("🎒 Инвентарь","m_inv"),("💍 Артефакты","m_arts"),("⚔️ Кузница","m_upgrade"),("📦 Кейсы","m_cases"),("🎒 Сумка артефактов","m_bag"),("🧳 Чемодан артефактов","m_case"),("👑 Элитный кейс","m_elite"),("🎁 Бонус","m_daily"),("🔄 Перерождение","m_rebirth"),("🏆 Топ","m_top"),("🎟 Промокод","m_promo"),("💎 Магазин","m_donate"),("❓ Помощь","m_help")]:
@@ -332,9 +358,9 @@ def main_menu():
 
 def admin_kb():
     b=InlineKeyboardBuilder()
-    for t,c in [("📢 Рассылка","a_broadcast"),("🔨 Бан","a_ban"),("💍 Артефакт","a_artifact"),("📊 Статистика","a_stats"),("◀ Назад","m_main")]:
+    for t,c in [("📢 Рассылка","a_broadcast"),("👤 Найти игрока","a_find"),("💰 Выдать золото","a_give_coins"),("💎 Выдать самоцветы","a_give_gems"),("👑 Выдать VIP","a_set_vip"),("🔨 Забанить","a_ban"),("🔓 Разбанить","a_unban"),("💍 Создать артефакт","a_artifact"),("🎟 Создать промокод","a_create_promo"),("📋 Список промокодов","a_list_promo"),("🗑 Удалить промокод","a_delete_promo"),("📊 Статистика","a_stats"),("◀ Назад","m_main")]:
         b.button(text=t,callback_data=c)
-    b.adjust(2)
+    b.adjust(1)
     return b.as_markup()
 
 active_fights = {}
@@ -360,21 +386,9 @@ async def profile(msg: Message):
 @dp.message(Command("admin"))
 async def admin(msg: Message):
     if not is_admin(msg.from_user.id): await msg.answer("⛔"); return
-    await msg.answer("⛏ Админ-панель",reply_markup=admin_kb())
+    await msg.answer("⛏ Админ-панель\nВыберите действие:",reply_markup=admin_kb())
 
-@dp.message(Command("createpromo"))
-async def create_promo(msg: Message):
-    if not is_admin(msg.from_user.id): return
-    p=msg.text.split()
-    if len(p)<6: await msg.answer("/createpromo КОД МОНЕТЫ САМОЦВЕТЫ ЛИМИТ ДНИ|permanent"); return
-    s=SessionLocal()
-    perm=p[5].lower()=="permanent"
-    exp=None if perm else datetime.now()+timedelta(days=int(p[5]))
-    s.add(PromoCode(code=p[1].upper(),reward_coins=int(p[2]),reward_gems=int(p[3]),uses_limit=int(p[4]),expires_at=exp,is_permanent=perm))
-    s.commit(); s.close()
-    await msg.answer(f"✅ Промокод {p[1].upper()} создан!")
-
-# ==================== CALLBACKS ====================
+# ==================== ГЛАВНОЕ МЕНЮ ====================
 
 @dp.callback_query(F.data=="m_main")
 async def cb_main(cb: CallbackQuery): await cb.message.edit_text("⛏ Меню",reply_markup=main_menu()); await cb.answer()
@@ -508,9 +522,9 @@ async def cb_open_case(cb: CallbackQuery):
         cum+=chance
         if r<=cum: reward=name; break
     if "золотых" in reward:
-        am=int(reward.split()[0]); u.coins+=am
+        u.coins+=int(reward.split()[0])
     elif "самоцветов" in reward:
-        am=int(reward.split()[0]); u.gems+=am
+        u.gems+=int(reward.split()[0])
     else:
         s.add(Inventory(user_id=u.id,item_type="special",item_name=reward,quantity=1))
     s.commit(); s.close()
@@ -598,22 +612,101 @@ async def cb_donate(cb: CallbackQuery):
 
 @dp.callback_query(F.data=="m_help")
 async def cb_help(cb: CallbackQuery):
-    await cb.message.edit_text("⛏ Помощь\n/menu /profile\n🎒 Сумка - 5000💰\n🧳 Чемодан - 500💎\n👑 Элитный - 2000💎\n📦 Кейсы за 💰 и 💎\n🎁 Ежедневный бонус\n🔄 Перерождение на 50 шахте",reply_markup=main_menu()); await cb.answer()
+    await cb.message.edit_text("⛏ Помощь\n/menu /profile /admin\n🎒 Сумка - 5000💰\n🧳 Чемодан - 500💎\n👑 Элитный - 2000💎\n📦 Кейсы за 💰 и 💎\n🎁 Ежедневный бонус\n🔄 Перерождение на 50 шахте",reply_markup=main_menu()); await cb.answer()
 
-# Админка
+# ==================== АДМИНКА ====================
+
 @dp.callback_query(F.data=="a_broadcast")
 async def cb_abroadcast(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("📢 Введите текст рассылки:"); await state.set_state(AdminStates.waiting_for_broadcast); await cb.answer()
 
 @dp.message(AdminStates.waiting_for_broadcast)
 async def broadcast(msg: Message, state: FSMContext):
-    s=SessionLocal(); users=s.query(User).all()
+    s=SessionLocal(); users=s.query(User).filter(User.notifications_enabled==True).all()
     ok=0
     for u in users:
         try: await bot.send_message(u.user_id,f"📢 {msg.text}"); ok+=1
         except: pass
     s.close(); await state.clear()
-    await msg.answer(f"Отправлено {ok} пользователям")
+    log_action(msg.from_user.id,"broadcast",details=msg.text[:100])
+    await msg.answer(f"Отправлено {ok} пользователям",reply_markup=admin_kb())
+
+@dp.callback_query(F.data=="a_find")
+async def cb_afind(cb: CallbackQuery):
+    await cb.message.edit_text("Введите ID игрока:"); await cb.answer()
+
+@dp.callback_query(F.data=="a_give_coins")
+async def cb_acoins(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("💰 Введите ID и сумму через пробел:\n123456789 10000"); await state.set_state(AdminStates.waiting_for_give_coins); await cb.answer()
+
+@dp.message(AdminStates.waiting_for_give_coins)
+async def give_coins(msg: Message, state: FSMContext):
+    try:
+        tid,amount=msg.text.split(); tid=int(tid); amount=int(amount)
+        s=SessionLocal(); u=get_user(s,tid); u.coins+=amount; s.commit(); s.close()
+        log_action(msg.from_user.id,"give_coins",tid,f"+{amount}")
+        await msg.answer(f"✅ +{amount}💰 игроку {tid}",reply_markup=admin_kb())
+        try: await bot.send_message(tid,f"💰 Админ выдал {amount} золота!")
+        except: pass
+    except: await msg.answer("❌ Формат: ID сумма")
+    await state.clear()
+
+@dp.callback_query(F.data=="a_give_gems")
+async def cb_agems(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("💎 Введите ID и сумму через пробел:"); await state.set_state(AdminStates.waiting_for_give_gems); await cb.answer()
+
+@dp.message(AdminStates.waiting_for_give_gems)
+async def give_gems(msg: Message, state: FSMContext):
+    try:
+        tid,amount=msg.text.split(); tid=int(tid); amount=int(amount)
+        s=SessionLocal(); u=get_user(s,tid); u.gems+=amount; s.commit(); s.close()
+        log_action(msg.from_user.id,"give_gems",tid,f"+{amount}")
+        await msg.answer(f"✅ +{amount}💎 игроку {tid}",reply_markup=admin_kb())
+    except: await msg.answer("❌ Формат: ID сумма")
+    await state.clear()
+
+@dp.callback_query(F.data=="a_set_vip")
+async def cb_avip(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("👑 Введите ID и уровень VIP (1-5):\n123456789 3"); await state.set_state(AdminStates.waiting_for_set_vip); await cb.answer()
+
+@dp.message(AdminStates.waiting_for_set_vip)
+async def set_vip(msg: Message, state: FSMContext):
+    try:
+        tid,level=msg.text.split(); tid=int(tid); level=int(level)
+        if level<0 or level>5: await msg.answer("0-5!"); return
+        s=SessionLocal(); u=get_user(s,tid); u.vip_level=level; update_stats(u); s.commit(); s.close()
+        log_action(msg.from_user.id,"set_vip",tid,f"level={level}")
+        await msg.answer(f"✅ VIP {level} игроку {tid}",reply_markup=admin_kb())
+    except: await msg.answer("❌ Формат: ID уровень")
+    await state.clear()
+
+@dp.callback_query(F.data=="a_ban")
+async def cb_aban(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("🔨 Введите ID и причину:\n123456789 спам"); await state.set_state(AdminStates.waiting_for_ban_reason); await cb.answer()
+
+@dp.message(AdminStates.waiting_for_ban_reason)
+async def ban_user(msg: Message, state: FSMContext):
+    try:
+        parts=msg.text.split(maxsplit=1); tid=int(parts[0]); reason=parts[1] if len(parts)>1 else "Нарушение"
+        s=SessionLocal(); u=get_user(s,tid); u.is_banned=True; u.ban_reason=reason; s.commit(); s.close()
+        log_action(msg.from_user.id,"ban",tid,reason)
+        await msg.answer(f"✅ Игрок {tid} забанен",reply_markup=admin_kb())
+    except: await msg.answer("❌ Ошибка")
+    await state.clear()
+
+@dp.callback_query(F.data=="a_unban")
+async def cb_aunban(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("🔓 Введите ID для разбана:"); await state.set_state(AdminStates.waiting_for_unban_id); await cb.answer()
+
+@dp.message(AdminStates.waiting_for_unban_id)
+async def unban_user(msg: Message, state: FSMContext):
+    try:
+        tid=int(msg.text)
+        s=SessionLocal(); u=get_user(s,tid); u.is_banned=False; u.ban_reason=""; s.commit(); s.close()
+        log_action(msg.from_user.id,"unban",tid)
+        await msg.answer(f"✅ Игрок {tid} разбанен",reply_markup=admin_kb())
+    except: await msg.answer("❌ Ошибка")
+    await state.clear()
 
 @dp.callback_query(F.data=="a_artifact")
 async def cb_aartifact(cb: CallbackQuery, state: FSMContext):
@@ -647,18 +740,106 @@ async def a_rarity(cb: CallbackQuery, state: FSMContext):
     tp=random.choice(av)
     art=Artifact(owner_id=target.id,name=tp["name"],artifact_type=at,rarity=r,damage_bonus=tp.get("damage_bonus",0),defense_bonus=tp.get("defense_bonus",0),health_bonus=tp.get("health_bonus",0))
     s.add(art); s.commit(); s.close()
+    log_action(cb.from_user.id,"create_artifact",tid,f"{art.name} ({r})")
     await cb.message.edit_text(f"✅ Артефакт {art.name} выдан!",reply_markup=admin_kb())
     try: await bot.send_message(tid,f"🎁 Админ выдал: {art.name}!")
     except: pass
     await state.clear(); await cb.answer()
 
+# Промокоды в админке
+@dp.callback_query(F.data=="a_create_promo")
+async def cb_create_promo_start(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("🎟 Введите КОД промокода:"); await state.set_state(AdminStates.waiting_for_promo_code); await cb.answer()
+
+@dp.message(AdminStates.waiting_for_promo_code)
+async def promo_code_input(msg: Message, state: FSMContext):
+    code=msg.text.upper()
+    s=SessionLocal()
+    if s.query(PromoCode).filter(PromoCode.code==code).first(): await msg.answer("❌ Уже существует!"); s.close(); return
+    s.close()
+    await state.update_data(promo_code=code)
+    await msg.answer("💰 Введите количество монет:"); await state.set_state(AdminStates.waiting_for_promo_coins)
+
+@dp.message(AdminStates.waiting_for_promo_coins)
+async def promo_coins_input(msg: Message, state: FSMContext):
+    await state.update_data(promo_coins=int(msg.text))
+    await msg.answer("💎 Введите количество самоцветов:"); await state.set_state(AdminStates.waiting_for_promo_gems)
+
+@dp.message(AdminStates.waiting_for_promo_gems)
+async def promo_gems_input(msg: Message, state: FSMContext):
+    await state.update_data(promo_gems=int(msg.text))
+    await msg.answer("👥 Введите лимит использований:"); await state.set_state(AdminStates.waiting_for_promo_limit)
+
+@dp.message(AdminStates.waiting_for_promo_limit)
+async def promo_limit_input(msg: Message, state: FSMContext):
+    await state.update_data(promo_limit=int(msg.text))
+    await msg.answer("⏰ Введите длительность (дней) или 'permanent' для вечного:\n30 = 30 дней\npermanent = навсегда"); await state.set_state(AdminStates.waiting_for_promo_duration)
+
+@dp.message(AdminStates.waiting_for_promo_duration)
+async def promo_duration_input(msg: Message, state: FSMContext):
+    dur=msg.text.lower()
+    is_perm=dur=="permanent"
+    days=int(dur) if not is_perm else 0
+    await state.update_data(promo_permanent=is_perm,promo_days=days)
+    await msg.answer("🎁 Введите название предмета (или '-' если без предмета):"); await state.set_state(AdminStates.waiting_for_promo_item)
+
+@dp.message(AdminStates.waiting_for_promo_item)
+async def promo_item_input(msg: Message, state: FSMContext):
+    item=msg.text if msg.text!="-" else None
+    data=await state.get_data()
+    s=SessionLocal()
+    exp=None if data["promo_permanent"] else datetime.now()+timedelta(days=data["promo_days"])
+    promo=PromoCode(code=data["promo_code"],reward_coins=data["promo_coins"],reward_gems=data["promo_gems"],uses_limit=data["promo_limit"],expires_at=exp,is_permanent=data["promo_permanent"],reward_item=item)
+    s.add(promo); s.commit(); s.close()
+    log_action(msg.from_user.id,"create_promo",details=f"Code: {data['promo_code']}, Perm: {data['promo_permanent']}")
+    await msg.answer(f"✅ Промокод {data['promo_code']} создан!",reply_markup=admin_kb())
+    await state.clear()
+
+@dp.callback_query(F.data=="a_list_promo")
+async def cb_list_promo(cb: CallbackQuery):
+    s=SessionLocal()
+    promos=s.query(PromoCode).order_by(PromoCode.created_at.desc()).limit(20).all()
+    if not promos: txt="Нет промокодов"
+    else:
+        txt="📋 Промокоды:\n\n"
+        for p in promos:
+            pt="♾️" if p.is_permanent else "📅"
+            txt+=f"{pt} {p.code} | {p.uses_count}/{p.uses_limit} | {'Активен' if p.is_active else 'Отключен'}\n"
+    s.close()
+    await cb.message.edit_text(txt,reply_markup=admin_kb()); await cb.answer()
+
+@dp.callback_query(F.data=="a_delete_promo")
+async def cb_delete_promo(cb: CallbackQuery, state: FSMContext):
+    s=SessionLocal()
+    promos=s.query(PromoCode).all()
+    if not promos: await cb.answer("Нет промокодов!"); s.close(); return
+    b=InlineKeyboardBuilder()
+    for p in promos[:20]:
+        b.button(text=f"{p.code}",callback_data=f"delp_{p.id}")
+    b.button(text="◀ Назад",callback_data="a_stats"); b.adjust(2)
+    s.close()
+    await cb.message.edit_text("Выберите промокод для удаления:",reply_markup=b.as_markup()); await cb.answer()
+
+@dp.callback_query(F.data.startswith("delp_"))
+async def cb_delp_confirm(cb: CallbackQuery):
+    pid=int(cb.data.split("_")[1])
+    s=SessionLocal()
+    p=s.query(PromoCode).filter(PromoCode.id==pid).first()
+    if p:
+        code=p.code; s.delete(p); s.commit()
+        log_action(cb.from_user.id,"delete_promo",details=f"Code: {code}")
+        await cb.answer(f"Промокод {code} удален!")
+    s.close()
+    await cb.message.edit_text("Промокод удален!",reply_markup=admin_kb()); await cb.answer()
+
 @dp.callback_query(F.data=="a_stats")
 async def cb_astats(cb: CallbackQuery):
     s=SessionLocal()
-    await cb.message.edit_text(f"📊 Игроков: {s.query(User).count()}\nVIP: {s.query(User).filter(User.vip_level>0).count()}\nАртефактов: {s.query(Artifact).count()}",reply_markup=admin_kb())
-    s.close(); await cb.answer()
+    txt=f"📊 Статистика:\n\n👥 Игроков: {s.query(User).count()}\n🔨 Забанено: {s.query(User).filter(User.is_banned==True).count()}\n👑 VIP: {s.query(User).filter(User.vip_level>0).count()}\n💍 Артефактов: {s.query(Artifact).count()}\n🎟 Промокодов: {s.query(PromoCode).count()}"
+    s.close()
+    await cb.message.edit_text(txt,reply_markup=admin_kb()); await cb.answer()
 
-# ==================== ШАХТЫ ====================
+# ==================== ШАХТЫ И БОИ ====================
 
 @dp.callback_query(F.data=="m_arenas")
 async def cb_arenas(cb: CallbackQuery):
@@ -703,7 +884,23 @@ async def cb_fight(cb: CallbackQuery, state: FSMContext):
     boss=s.query(Boss).filter(Boss.arena_id==ar.id,Boss.boss_number==bn).first()
     active_fights[cb.from_user.id]={"an":an,"bn":bn,"uhp":u.max_health,"bhp":boss.health}
     await state.set_state(FightStates.in_fight); s.close()
-    await cb.message.edit_text(f"⚔️ БОЙ!\n👹 {boss.name}\n❤️ {boss.health}\n\nТы: ❤️ {u.max_health} | ⚔️ {u.damage}",reply_markup=InlineKeyboardBuilder().button(text="⚔️ Атаковать",callback_data=f"atk_{an}_{bn}").button(text="🏃 Сбежать",callback_data="m_arenas").adjust(1).as_markup()); await cb.answer()
+    b=InlineKeyboardBuilder()
+    b.button(text="⚔️ Атаковать",callback_data=f"atk_{an}_{bn}")
+    b.button(text="💊 Зелье",callback_data=f"pot_{an}_{bn}")
+    b.button(text="🏃 Сбежать",callback_data="m_arenas"); b.adjust(2)
+    await cb.message.edit_text(f"⚔️ БОЙ!\n👹 {boss.name}\n❤️ {boss.health}\n\nТы: ❤️ {u.max_health} | ⚔️ {u.damage}",reply_markup=b.as_markup()); await cb.answer()
+
+@dp.callback_query(F.data.startswith("pot_"),FightStates.in_fight)
+async def cb_potion(cb: CallbackQuery):
+    if cb.from_user.id not in active_fights: await cb.answer("Нет боя!"); return
+    f=active_fights[cb.from_user.id]; _,an,bn=cb.data.split("_")
+    s=SessionLocal(); u=get_user(s,cb.from_user.id)
+    pot=s.query(Inventory).filter(Inventory.user_id==u.id,Inventory.item_name=="Шахтерское зелье").first()
+    if not pot or pot.quantity<1: await cb.answer("Нет зелий!"); s.close(); return
+    pot.quantity-=1
+    if pot.quantity<=0: s.delete(pot)
+    heal=50; f["uhp"]=min(f["uhp"]+heal,u.max_health); s.commit(); s.close()
+    await cb.answer(f"+{heal} HP!")
 
 @dp.callback_query(F.data.startswith("atk_"),FightStates.in_fight)
 async def cb_attack(cb: CallbackQuery, state: FSMContext):
@@ -729,7 +926,11 @@ async def cb_attack(cb: CallbackQuery, state: FSMContext):
         s.close(); del active_fights[cb.from_user.id]; await state.clear()
         await cb.message.edit_text("💀 Поражение!",reply_markup=main_menu()); await cb.answer("Поражение!"); return
     s.close()
-    await cb.message.edit_text(f"⚔️ Ты нанёс {dmg}\n👹 HP: {f['bhp']}/{boss.health}\n❤️ Ты: {f['uhp']}/{u.max_health}",reply_markup=InlineKeyboardBuilder().button(text="⚔️ Атаковать",callback_data=f"atk_{an}_{bn}").button(text="🏃 Сбежать",callback_data="m_arenas").adjust(1).as_markup()); await cb.answer()
+    b=InlineKeyboardBuilder()
+    b.button(text="⚔️ Атаковать",callback_data=f"atk_{an}_{bn}")
+    b.button(text="💊 Зелье",callback_data=f"pot_{an}_{bn}")
+    b.button(text="🏃 Сбежать",callback_data="m_arenas"); b.adjust(2)
+    await cb.message.edit_text(f"⚔️ Ты нанёс {dmg}\n👹 HP: {f['bhp']}/{boss.health}\n❤️ Ты: {f['uhp']}/{u.max_health}",reply_markup=b.as_markup()); await cb.answer()
 
 # ==================== ЗАПУСК ====================
 
