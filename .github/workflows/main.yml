@@ -9,11 +9,27 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v3
+      
+      - name: Cache DB
+        uses: actions/cache@v3
+        with:
+          path: dark_mines.db
+          key: db-${{ github.run_id }}
+          restore-keys: db-
+      
       - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+      
       - run: pip install aiogram sqlalchemy aiohttp
       - run: python bot.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      
+      - name: Commit DB
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add dark_mines.db
+          git diff --staged --quiet || (git commit -m "Save DB" && git push)
